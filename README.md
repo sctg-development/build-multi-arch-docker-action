@@ -26,7 +26,7 @@ on:
 
 jobs:
   build:
-    uses: sctg-development/build-multi-arch-docker-action@v1
+    uses: sctg-development/build-multi-arch-docker-action/.github/workflows/build.yml@v1
     with:
       dockerfile: Dockerfile
       image: myorg/myimage
@@ -48,10 +48,11 @@ on:
 permissions:
   contents: write
   id-token: write
+  attestations: write
 
 jobs:
   build:
-    uses: sctg-development/build-multi-arch-docker-action@v1
+    uses: sctg-development/build-multi-arch-docker-action/.github/workflows/build.yml@v1
     with:
       dockerfile: Dockerfile
       image: myorg/myimage
@@ -70,9 +71,12 @@ jobs:
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `dockerfile` | Yes | `Dockerfile` | Path to the Dockerfile to build |
+| `dockerfile` | No | `Dockerfile` | Path to the Dockerfile to build |
 | `image` | Yes | - | Docker Hub image name (e.g., `user/repo`) |
-| `artifact-prefix` | Yes | - | Unique prefix for digest artifacts to avoid conflicts |
+| `context` | No | `.` | Docker build context |
+| `tags` | No | `''` | Tags in `docker/metadata-action` format (multiline); empty = defaults |
+| `build-args` | No | `''` | Build arguments (multiline `KEY=VALUE`) |
+| `artifact-prefix` | No | run id | Unique prefix for artifacts to avoid conflicts |
 | `cleanup` | No | `true` | Clean up runner disk space before building (recommended) |
 | `extract-binary` | No | `false` | Extract binary from the built image |
 | `binary-path` | No | `''` | Path to the binary inside the container |
@@ -86,7 +90,6 @@ jobs:
 |--------|----------|-------------|
 | `DOCKER_USERNAME` | Yes | Docker Hub username |
 | `DOCKER_PASSWORD` | Yes | Docker Hub password or access token |
-| `DOCKER_IMAGE_NAME` | No | Optional Docker Hub image name override |
 
 ## Outputs
 
@@ -107,7 +110,7 @@ Each architecture is built **natively** (no QEMU emulation), then the digests ar
 1. **Build Phase**: Two parallel jobs build the Docker image on amd64 and arm64 runners
 2. **Digest Export**: Each job exports its image digest as an artifact
 3. **Merge Phase**: A third job downloads both digests and creates a multi-arch manifest
-4. **Binary Extraction** (optional): Extracts binaries from both architectures and uploads to release
+4. **Binary Extraction** (optional): each native build job extracts its binary; a final job uploads them to the release
 5. **Attestation** (optional): Creates SLSA provenance attestations for extracted binaries
 
 ## Best Practices
@@ -148,11 +151,11 @@ on:
 permissions:
   contents: write
   id-token: write
-  packages: write
+  attestations: write
 
 jobs:
   build-and-publish:
-    uses: sctg-development/build-multi-arch-docker-action@v1
+    uses: sctg-development/build-multi-arch-docker-action/.github/workflows/build.yml@v1
     with:
       dockerfile: Dockerfile
       image: myorg/myapp

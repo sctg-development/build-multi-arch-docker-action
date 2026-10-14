@@ -6,16 +6,32 @@ on:
       dockerfile:
         description: 'Path to the Dockerfile to build'
         type: string
-        required: true
+        required: false
         default: 'Dockerfile'
+      context:
+        description: 'Docker build context'
+        type: string
+        required: false
+        default: '.'
       image:
         description: 'Docker Hub image name (e.g., user/repo)'
         type: string
         required: true
-      artifact-prefix:
-        description: 'Unique prefix for digest artifacts to avoid conflicts'
+      tags:
+        description: 'Tags in docker/metadata-action format (multiline). Empty = metadata-action defaults'
         type: string
-        required: true
+        required: false
+        default: ''
+      build-args:
+        description: 'Build arguments (multiline KEY=VALUE)'
+        type: string
+        required: false
+        default: ''
+      artifact-prefix:
+        description: 'Unique prefix for artifacts to avoid conflicts (defaults to the run id)'
+        type: string
+        required: false
+        default: ''
       cleanup:
         description: 'Clean up runner disk space before building'
         type: boolean
@@ -53,18 +69,21 @@ on:
       DOCKER_PASSWORD:
         required: true
         description: 'Docker Hub password or token'
-      DOCKER_IMAGE_NAME:
-        required: false
-        description: 'Optional Docker Hub image name override'
     outputs:
       image-digest:
         description: 'SHA256 digest of the built multi-arch image'
         value: ${{ jobs.merge.outputs.digest }}
 
+env:
+  IMAGE: ${{ inputs.image }}
+  ARTIFACT_PREFIX: ${{ inputs.artifact-prefix || github.run_id }}
+
 jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -76,6 +95,20 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-26.04-arm
     steps:
+      - name: Validate binary extraction inputs
+        if: ${{ inputs.extract-binary }}
+        env:
+          BINARY_PATH: ${{ inputs.binary-path }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          for v in BINARY_PATH BINARY_NAME RELEASE_TAG; do
+            if [[ -z "${!v}" ]]; then
+              echo "::error::${v} is required when extract-binary is true"
+              exit 1
+            fi
+          done
+
       - name: Optimize disk space
         if: ${{ inputs.cleanup }}
         uses: sctg-development/clean-image-for-docker@v2
@@ -96,29 +129,58 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ inputs.image || secrets.DOCKER_IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
 
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           file: ${{ inputs.dockerfile }}
-          context: .
+          context: ${{ inputs.context }}
           platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ inputs.image || secrets.DOCKER_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.ARTIFACT_PREFIX }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ env.ARTIFACT_PREFIX }}-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.artifact-prefix }}-digests-${{ matrix.arch }}
+          name: ${{ env.ARTIFACT_PREFIX }}-digests-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Extract binary from the image (native)
+        if: ${{ inputs.extract-binary }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          BINARY_PATH: ${{ inputs.binary-path }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          out="${RUNNER_TEMP}/binaries"
+          mkdir -p "$out"
+          docker pull "${IMAGE}@${DIGEST}"
+          cid=$(docker create "${IMAGE}@${DIGEST}")
+          docker cp "${cid}:${BINARY_PATH}" "${out}/${BINARY_NAME}_linux_${ARCH}_${RELEASE_TAG}"
+          docker rm "$cid"
+
+      - name: Upload binary artifact
+        if: ${{ inputs.extract-binary }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-binary-${{ matrix.arch }}
+          path: ${{ runner.temp }}/binaries/*
           if-no-files-found: error
           retention-days: 1
 
@@ -126,6 +188,8 @@ jobs:
     name: Merge manifests
     runs-on: ubuntu-26.04
     needs: build
+    permissions:
+      contents: read
     outputs:
       digest: ${{ steps.merge.outputs.digest }}
     steps:
@@ -133,7 +197,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: ${{ inputs.artifact-prefix }}-digests-*
+          pattern: ${{ env.ARTIFACT_PREFIX }}-digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -149,79 +213,54 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ inputs.image || secrets.DOCKER_IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
+          tags: ${{ inputs.tags }}
 
       - name: Create manifest list and push
         id: merge
         working-directory: ${{ runner.temp }}/digests
         run: |
-          IMAGE=${{ inputs.image || secrets.DOCKER_IMAGE_NAME }}
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '$IMAGE@sha256:%s ' *)
-          
-          MANIFEST_DIGEST=$(docker buildx imagetools inspect $IMAGE:${{ steps.meta.outputs.version }} --format '{{.Digest}}')
-          echo "digest=$MANIFEST_DIGEST" >> $GITHUB_OUTPUT
+          mapfile -t TAG_ARGS < <(jq -r '.tags[] | "-t\n" + .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          SOURCES=()
+          for d in *; do SOURCES+=("${IMAGE}@sha256:${d}"); done
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
+
+          FIRST_TAG=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          MANIFEST_DIGEST=$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "digest=$MANIFEST_DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Inspect image
-        run: docker buildx imagetools inspect ${{ inputs.image || secrets.DOCKER_IMAGE_NAME }}:${{ steps.meta.outputs.version }}
-
-  extract-and-upload:
-    name: Extract and upload binaries
-    runs-on: ubuntu-latest
-    needs: merge
-    if: ${{ inputs.extract-binary }}
-    steps:
-      - name: Validate binary extraction inputs
-        run: |
-          if [[ -z "${{ inputs.binary-path }}" ]]; then
-            echo "::error::binary-path is required when extract-binary is true"
-            exit 1
-          fi
-          if [[ -z "${{ inputs.binary-name }}" ]]; then
-            echo "::error::binary-name is required when extract-binary is true"
-            exit 1
-          fi
-          if [[ -z "${{ inputs.release-tag }}" ]]; then
-            echo "::error::release-tag is required when extract-binary is true"
-            exit 1
-          fi
-
-      - name: Pull and extract files from Docker image (amd64)
-        continue-on-error: true
-        run: |
-          IMAGE=${{ inputs.image || secrets.DOCKER_IMAGE_NAME }}
-          mkdir -p /tmp/amd64/
-          docker pull $IMAGE:latest
-          docker create --platform linux/amd64 --name temp-container-amd64 $IMAGE:latest
-          docker cp temp-container-amd64:${{ inputs.binary-path }} /tmp/amd64/
-          docker rm temp-container-amd64
-          cd /tmp/amd64/
-          mv $(basename ${{ inputs.binary-path }}) ${{ inputs.binary-name }}_linux_amd64_${{ inputs.release-tag }}
-
-      - name: Pull and extract files from Docker image (arm64)
-        continue-on-error: true
-        run: |
-          IMAGE=${{ inputs.image || secrets.DOCKER_IMAGE_NAME }}
-          mkdir -p /tmp/arm64/
-          docker pull $IMAGE:latest
-          docker create --platform linux/arm64 --name temp-container-arm64 $IMAGE:latest
-          docker cp temp-container-arm64:${{ inputs.binary-path }} /tmp/arm64/
-          docker rm temp-container-arm64
-          cd /tmp/arm64/
-          mv $(basename ${{ inputs.binary-path }}) ${{ inputs.binary-name }}_linux_arm64_${{ inputs.release-tag }}
-
-      - name: Upload Release
-        continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: docker buildx imagetools inspect "${IMAGE}@${DIGEST}"
+
+  release-binaries:
+    name: Publish binaries
+    runs-on: ubuntu-26.04
+    needs: [build, merge]
+    if: ${{ inputs.extract-binary }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/binaries
+          pattern: ${{ env.ARTIFACT_PREFIX }}-binary-*
+          merge-multiple: true
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
         run: |
-          gh release upload ${{ inputs.release-tag }} /tmp/amd64/${{ inputs.binary-name }}_linux_amd64_${{ inputs.release-tag }} --clobber
-          gh release upload ${{ inputs.release-tag }} /tmp/arm64/${{ inputs.binary-name }}_linux_arm64_${{ inputs.release-tag }} --clobber
+          gh release upload "$RELEASE_TAG" "${RUNNER_TEMP}"/binaries/* --clobber
 
       - name: Attest release
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@v1
-        continue-on-error: true
         with:
-          subject-path: '/tmp/amd64/${{ inputs.binary-name }}_linux_amd64_${{ inputs.release-tag }},/tmp/arm64/${{ inputs.binary-name }}_linux_arm64_${{ inputs.release-tag }}'
+          subject-path: ${{ runner.temp }}/binaries/*
