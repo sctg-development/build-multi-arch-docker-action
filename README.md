@@ -83,6 +83,7 @@ jobs:
 | `binary-name` | No | `''` | Base name for the extracted binary |
 | `release-tag` | No | `''` | GitHub release tag name for upload |
 | `attest` | No | `false` | Create SLSA build provenance attestation |
+| `submodules` | No | `false` | Checkout submodules: false, true or recursive |
 
 ## Secrets
 
