@@ -32,6 +32,11 @@ on:
         type: string
         required: false
         default: ''
+      submodules:
+        description: 'Checkout submodules: false, true or recursive'
+        type: string
+        required: false
+        default: 'false'
       cleanup:
         description: 'Clean up runner disk space before building'
         type: boolean
@@ -115,6 +120,8 @@ jobs:
 
       - name: Check out the repo
         uses: actions/checkout@v7
+        with:
+          submodules: ${{ inputs.submodules }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
